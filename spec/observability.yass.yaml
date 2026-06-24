@@ -1,0 +1,112 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The observability goroutine, the metrics inventory with dual
+  Prometheus/OpenTelemetry naming, MetricsChan, and ConfigureOtel. The
+  observability goroutine runs unconditionally under Start on a staggered
+  offset, snapshots managed_partitions read-only once per tick, and feeds
+  in-process atomic counters and gauges to the Prometheus pull channel and
+  the OpenTelemetry collector.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.ObservabilityGoroutine
+INPUT:
+- MUST: be started by Start unconditionally, running even if neither MetricsChan nor ConfigureOtel is ever called
+- MUST: take the context from Start, running until that context is cancelled
+RETURN:
+- MUST: follow the same panic-proof defer/recover pattern as the maintenance goroutine, so a panic in the inner work function logs and resumes on the next tick rather than killing the goroutine
+- MUST: reuse the maintenance goroutine's computed offset minus 1 second, staggering the two goroutines' tick starts so they do not begin together
+  USES: ./scheduler@parter.TickOffset
+- WHEN: the maintenance offset is less than 1 second
+  MUST: "wrap the subtraction modularly within the 60-second window (e.g. maintenance offset 0.3s yields observability offset 59.3s)"
+SIDE-EFFECT:
+- MUST: "each tick query managed_partitions for all rows in a single read-only snapshot SELECT that neither takes nor waits on the FOR UPDATE row locks the maintenance pass holds"
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: "each tick compute per-table the count of pending rows where range_start <= now() (overdue creates)"
+- MUST: "each tick compute per-table the count of created rows where range_end < now() - retention_interval (overdue drops), skipping this computation for tables with Retention = 0"
+- MUST: "each tick compute per-table headroom as max(range_end) over created rows minus now()"
+- MUST: detect events by combining metadata diffs with atomic counter changes
+- MUST: "detect error events by comparing the atomic error counters against their previous-tick values, because most individual failures do not change status (a failing pending row stays pending and only its fail_count advances)"
+- MUST: "treat the pending -> failed transition as additionally visible in the metadata diff"
+- MUST: each tick update the in-process counters and gauges
+  USES: parter.Metrics
+- MUST: each tick emit to the Prometheus channel and/or the OpenTelemetry collector
+- SEE: ./coordination@parter.Coordination::INVARIANT
+ERROR:
+- MUST: increment parter.observer_errors_total on a query failure
+---
+spec: parter.Metrics
+INPUT:
+- MUST: "have the maintenance goroutine update shared atomic.Int64 counters directly as it completes each create/drop/error outcome"
+  SEE: ./create@parter.CreatePass
+- MUST: have the observability goroutine read these atomics plus the metadata table to produce the full snapshot
+- MUST-NOT: require a mutex to coordinate access to the counters
+RETURN:
+- MUST: give each metric one canonical identity spelled differently per surface
+- MUST: "spell the OTel instrument name dotted (e.g. parter.created_total)"
+- MUST: "replace each dot with an underscore in the Prometheus text form (e.g. parter_created_total), because Prometheus names must match the regex for Prometheus metric names and cannot contain dots, following standard OTel->Prometheus translation"
+- MUST: "have ConfigureOtel report the dotted parter.* names and MetricsChan emit the underscore parter_* names"
+- MUST: "expose monotonic counter parter.created_total (parter_created_total), label table: partitions successfully created since process start"
+  SEE: ./retention@parter.RetentionDetach
+- MUST: "expose monotonic counter parter.dropped_total (parter_dropped_total), label table: partitions successfully dropped"
+- MUST: "expose monotonic counter parter.create_errors_total (parter_create_errors_total), label table: create attempts that failed including attach/boundary-verification failures"
+- MUST: "expose monotonic counter parter.detach_errors_total (parter_detach_errors_total), label table: DETACH attempts that failed in Step 1"
+- MUST: "expose monotonic counter parter.drop_errors_total (parter_drop_errors_total), label table: DROP TABLE attempts that failed in Step 2"
+- MUST: "expose monotonic counter parter.observer_errors_total (parter_observer_errors_total), no label: observability goroutine query failures"
+- MUST: "expose gauge parter.pending (parter_pending), label table: current count of pending rows"
+- MUST: "expose gauge parter.overdue (parter_overdue), label table: pending rows where range_start <= now()"
+- MUST: "expose gauge parter.headroom_seconds (parter_headroom_seconds), label table: max(range_end) over created rows minus now() in seconds, clamped at 0; 0 means writes are already hitting DEFAULT"
+- MUST: "expose gauge parter.created (parter_created), label table: current count of created rows"
+- MUST: "expose gauge parter.retention_overdue (parter_retention_overdue), label table: created rows past their retention window, 0 for tables with Retention = 0"
+- MUST: "expose gauge parter.failed (parter_failed), label table: current count of failed rows requiring manual investigation"
+INVARIANT:
+- MUST: make the counters atomic.Int64 and run the metadata query as its own transaction, so no mutex is needed
+- MUST-NOT: expose a partitions_skipped_total counter, because SKIP LOCKED cannot distinguish "another instance handled this row" from "there was no actionable work"; the pending and overdue gauges already surface that signal
+---
+spec: parter.MetricsChan
+INPUT:
+- MUST: accept a context.Context and a Config
+  USES: ./config@parter.Config
+RETURN:
+- MUST: "return a channel that emits a complete Prometheus text exposition payload (# HELP, # TYPE, and metric lines, metric names in the underscore parter_* form) once per observability tick, suitable for concatenation into an existing /metrics response"
+  USES: parter.Metrics
+- MUST: return an unbuffered channel
+- MAY: be called multiple times, each call returning an independent channel
+- MUST: return raw text bytes rather than Prometheus collector objects, to avoid importing the Prometheus client library as a hard dependency
+- MUST-NOT: import net/http; the caller owns the HTTP handler
+SIDE-EFFECT:
+- MUST: make the send non-blocking
+  USES: parter.ObservabilityGoroutine
+- WHEN: the caller is not reading at the instant of a tick
+  MUST: drop that tick's payload and emit the next one a tick later
+- MUST-NOT: start or own the observability goroutine, which is owned by Start and lives for Start's context
+- WHEN: ctx is cancelled
+  MUST: stop sending to this channel and close it, leaving the observability goroutine and any other subscribers unaffected
+---
+spec: parter.ConfigureOtel
+INPUT:
+- MUST: accept an OpenTelemetry MeterProvider and TracerProvider
+RETURN:
+- MUST: "once configured, register all counters and gauges as OTel instruments (dotted parter.* names) reported on the provider's export interval, and emit spans on every maintenance tick"
+  USES: parter.Metrics
+SIDE-EFFECT:
+- MUST: register the metrics and trace spans
+- MUST: "wrap each maintenance tick in a span parter.tick with child spans parter.create (the create pass) and parter.retention (covering detach, drop, and recovery)"
+  USES: ./scheduler@parter.MaintenanceLoop
+- MUST: "include span attributes table, partition_name, range_start, range_end, and outcome (created, detached, dropped, or error)"
+- MUST-NOT: emit a skipped outcome; SKIP LOCKED returning no row produces no per-partition span
+- MUST: "wrap the observability goroutine's metadata query in a span parter.observe"
+  USES: parter.ObservabilityGoroutine
+- MUST: "place the OTel integration surface in a separate sub-package (parter/otel)"
+- WHEN: ConfigureOtel is never called
+  MUST: import no OTel packages at build time
+ERROR:
+- MUST: be called after Start
+  SEE: ./start@parter.Start
+- WHEN: ConfigureOtel is called before Start
+  MUST: panic, because the observability goroutine is not yet running
+- MUST: be called at most once
+- WHEN: ConfigureOtel is called a second time
+  MUST: panic, to prevent duplicate OTel instrument registration

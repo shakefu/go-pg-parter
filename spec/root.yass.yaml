@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The go-pg-parter library entry point. Reaches every module spec in the
+  tree in implementation order: the public configuration types and API
+  surface, the metadata table, the scheduler, the reconcile/create/retention
+  passes, and the observability goroutine, all coordinated under the
+  lock-free coordination properties.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter
+INPUT:
+- MUST: accept a Config argument bundle
+  USES: ./config@parter.Config
+- MUST: validate Config before any operation
+  USES: ./config@parter.ValidateConfig
+RETURN:
+- MUST: expose Table as a configuration type
+  USES: ./config@parter.Table
+- MUST: expose RangeStrategy as a configuration type
+  USES: ./config@parter.RangeStrategy
+- MUST: expose EnsureReady for synchronous startup readiness
+  USES: ./ensure-ready@parter.EnsureReady
+- MUST: expose Start to launch background maintenance
+  USES: ./start@parter.Start
+- MUST: expose MetricsChan for Prometheus integration
+  USES: ./observability@parter.MetricsChan
+- MUST: expose ConfigureOtel for OpenTelemetry integration
+  USES: ./observability@parter.ConfigureOtel
+SIDE-EFFECT:
+- MUST: maintain the managed_partitions metadata table
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: schedule maintenance on the per-instance tick offset
+  USES: ./scheduler@parter.MaintenanceLoop
+- MUST: reconcile the desired partition set each tick
+  USES: ./reconcile@parter.Reconcile
+- MUST: create partitions via the create pass
+  USES: ./create@parter.CreatePass
+- MUST: drop expired partitions via the retention pass
+  USES: ./retention@parter.RetentionPass
+- MUST: expose metrics via the observability goroutine
+  USES: ./observability@parter.ObservabilityGoroutine
+INVARIANT:
+- CONFORMS: ./coordination@parter.Coordination::INVARIANT

@@ -1,0 +1,61 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The per-instance tick offset scheme and the panic-proof background
+  maintenance goroutine. The offset spreads replicas deterministically
+  across the 60-second tick window from goroutine startup time (and an
+  optional instance ordinal); the maintenance loop ticks on a fixed-epoch
+  schedule, runs reconcile/create/retention passes per tick under a
+  defer/recover wrapper, and bounds each tick with a non-configurable
+  55-second deadline.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.TickOffset
+INPUT:
+- MUST: accept startup_seconds_with_fraction, the seconds-and-microseconds component of the wall clock at goroutine launch (e.g. 47.891234 from 14:23:47.891234)
+- MAY: accept Instance, an externally provided ordinal
+RETURN:
+- MUST: "compute the base offset as `offset = (startup_seconds_with_fraction * 23) mod 60`"
+- MUST: use 23 as the multiplier because 23 is coprime to 60, so integer-second inputs cycle through all 60 positions before repeating and consecutive startup seconds map to offsets 23 seconds apart
+- WHEN: Instance is non-nil
+  MUST: "compute the offset as `offset = (startup_seconds_with_fraction * 23 + *Instance * 23) mod 60`"
+- MUST: round the final offset to the nearest millisecond, ties rounding up, to prevent floating-point accumulation errors in tick scheduling
+- MUST: "tick after the initial offset on a fixed-epoch schedule `next_tick = process_start + offset + N * 60s`, measured from the epoch and not from when the previous tick finished, so two instances keep constant separation indefinitely"
+INVARIANT:
+- MUST: be deterministic and reproducible for debugging
+- MUST: treat *Instance as spreading usefully only modulo 60, since instance ordinals differing by a multiple of 60 contribute no additional separation
+- SEE: ./coordination@parter.Coordination::INVARIANT
+---
+spec: parter.MaintenanceLoop
+INPUT:
+- MUST: accept a context.Context
+- MUST: accept the validated Config
+  USES: ./config@parter.Config
+RETURN:
+- MUST: compute the offset, set epoch to process_start plus offset, sleep until epoch, then loop
+  USES: parter.TickOffset
+- MUST: "on each iteration N run the work function, then advance to `next_tick = epoch + N*60s`"
+- MUST: skip missed ticks by advancing N until next_tick is in the future rather than busy-looping
+- MUST: sleep until next_tick after advancing, or return when ctx is Done
+SIDE-EFFECT:
+- MUST: run the work function each tick in order, first reconciling pending rows, then draining the create pass, then running the retention pass per registered table
+- MUST: iterate tables in Config.Tables order, draining each table fully before moving to the next
+- MUST: reconcile pending rows on each tick before the create pass
+  USES: ./reconcile@parter.Reconcile
+- MUST: drain the create pass on each tick after reconciliation
+  USES: ./create@parter.CreatePass
+- WHEN: the table Retention is greater than 0
+  MUST: run the retention pass for that table after the create pass
+  USES: ./retention@parter.RetentionPass
+ERROR:
+- MUST: run the inner work function inside a defer/recover wrapper
+- MUST: log a panic and resume on the next tick rather than killing the goroutine
+- MUST: run each tick with a derived context carrying a fixed 55-second deadline named TickDeadline, a non-configurable constant
+- WHEN: the context expires due to stuck DDL, pool exhaustion, or any other delay
+  MUST: cancel and roll back the in-progress transaction and proceed to the next tick
+INVARIANT:
+- MUST: "hold TickDeadline (55s) strictly less than the tick interval (60s); `TickDeadline < tickInterval` is an invariant"
+- MUST: guarantee via the tight deadline that the goroutine never misses more than one tick due to a single hung operation
+- SEE: ./coordination@parter.Coordination::INVARIANT

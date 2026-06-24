@@ -1,0 +1,81 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The retention pass — skip guard, interval conversion, in-tick step order,
+  and the two steps detach / drop. Encodes the zero-retention skip guard, the
+  Strategy-driven integer-to-calendar-interval conversion, the mandatory
+  in-tick step order (detach before drop), and the use of a plain transactional
+  DETACH PARTITION that is compatible with the parent's required DEFAULT
+  partition. Detach is made safe by atomicity rather than by crash recovery.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.RetentionPass
+INPUT:
+- MUST: run per table, using the table Retention and Strategy
+RETURN:
+- WHEN: the table Retention == 0 (meaning never drop)
+  MUST: skip the retention pass ENTIRELY
+- WHEN: "Retention == 0, because a zero retention interval would make \"range_end < now() - interval '0'\" match all historical partitions and drop everything"
+  MUST: skip the retention pass ENTIRELY
+- WHEN: Retention > 0
+  MUST: "convert the integer to a calendar interval per Strategy — Retention periods of the strategy unit: Monthly -> interval '3 months', Weekly -> interval '3 weeks', Daily -> interval '3 days' for Retention=3"
+- WHEN: Retention > 0
+  MUST: use this retention_interval in the SQL filter of Step 1 and the observer
+SIDE-EFFECT:
+- MUST: "within a tick run the steps in the order detach -> drop: first detach newly-expired partitions (Step 1), then drop everything that reached detached (Step 2)"
+  USES: parter.RetentionDetach
+- MUST: first detach newly-expired partitions (Step 1)
+  USES: parter.RetentionDetach
+- MUST: then drop everything that reached detached (Step 2)
+  USES: parter.RetentionDrop
+- MUST: "drain the eligible rows of Steps 1 and 2 fully, attempting each eligible row AT MOST ONCE per tick via an in-memory attempted set, so a persistently failing row neither livelocks the pass nor starves the rest and is retried on the next tick"
+- MUST: reach detached for a freshly-detached row via Step 1's own in-transaction UPDATE, then drop it via Step 2 in a separate transaction
+  SEE: ./coordination@parter.Coordination::INVARIANT
+---
+spec: parter.RetentionDetach
+INPUT:
+- MUST: run per table, selecting candidates with status = created
+- MUST: maintain an in-memory attempted set of partition names tried this tick, attempting each at most once
+RETURN:
+- MUST: "issue \"BEGIN; SELECT ... WHERE table_name = <t> AND status = 'created' AND range_end < now() - retention_interval ORDER BY range_start FOR UPDATE SKIP LOCKED LIMIT 1\""
+- WHEN: no row is returned
+  MUST: COMMIT and exit the pass
+- WHEN: a row is returned
+  MUST: add it to the attempted set, then in the SAME transaction execute the detach and the status update and COMMIT them atomically
+SIDE-EFFECT:
+- MUST: "issue a plain \"ALTER TABLE <table_name> DETACH PARTITION <partition_name>\" (NOT CONCURRENTLY) inside the same transaction as the metadata update"
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: "use a plain DETACH PARTITION (PostgreSQL 14+) rather than DETACH ... CONCURRENTLY, because CONCURRENTLY is rejected when the parent has a DEFAULT partition (SQLSTATE 55000, 'cannot detach partitions concurrently when a default partition exists'), and every managed table is required to have a DEFAULT partition"
+- MUST: "hold ACCESS EXCLUSIVE on the parent only for the brief, catalog-only duration of the detach (no data is rewritten), releasing it at COMMIT"
+- WHEN: the detach succeeds
+  MUST: "execute \"UPDATE ... SET status = 'detached' WHERE (table_name, partition_name) = (...)\" in the SAME transaction, then COMMIT, so the detach and the status update are atomic"
+ERROR:
+- WHEN: the DETACH or its surrounding transaction errors
+  MUST: "ROLLBACK (which leaves status = created and the partition still attached), increment parter.detach_errors_total, and retry the row on a later tick"
+  USES: ./observability@parter.Metrics
+INVARIANT:
+- MUST: "be crash-safe by atomicity: because the detach and the status update commit together, an interrupted or failed detach rolls back wholesale, leaving the row created with no partially-detached limbo and nothing to recover"
+  SEE: ./coordination@parter.Coordination::INVARIANT
+- MUST: "rely on PostgreSQL permitting only one detach per parent at a time (the brief ACCESS EXCLUSIVE on the parent serializes concurrent detaches) and on FOR UPDATE SKIP LOCKED ensuring only one instance acts on a given partition row, so two detaches of the same partition never overlap"
+---
+spec: parter.RetentionDrop
+INPUT:
+- MUST: run per table, selecting candidates with status = detached
+- MUST: maintain an in-memory attempted set of partition names tried this tick, attempting each at most once
+RETURN:
+- MUST: "issue \"BEGIN; SELECT ... WHERE table_name = <t> AND status = 'detached' ORDER BY range_start FOR UPDATE SKIP LOCKED LIMIT 1\""
+- WHEN: no row is returned
+  MUST: COMMIT and exit the pass
+SIDE-EFFECT:
+- MUST: "execute \"DROP TABLE IF EXISTS <partition_name>\" then \"DELETE FROM parter.managed_partitions WHERE (table_name, partition_name) = (...)\" then COMMIT"
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: increment parter.dropped_total
+  USES: ./observability@parter.Metrics
+- MUST: "run the DROP in a separate transaction from the detach so the slower DROP TABLE never holds the parent's lock"
+- MUST: "use partition-based retention via DROP TABLE to avoid scanning and generating dead tuples — the entire motivation for RANGE partitioning over a bulk DELETE"
+ERROR:
+- WHEN: the drop errors
+  MUST: "ROLLBACK (the transaction rolls back cleanly), increment parter.drop_errors_total, leave the row as detached, and retry on the next tick"
+  USES: ./observability@parter.Metrics

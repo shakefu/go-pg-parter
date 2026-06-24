@@ -1,0 +1,72 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The create pass that drains pending rows into attached partitions, and the
+  circuit breaker that parks deterministically-poison rows after repeated
+  failures. The create pass selects one pending row at a time with FOR UPDATE
+  SKIP LOCKED, issues CREATE TABLE, verifies attachment, and commits the
+  status update atomically; the circuit breaker tracks fail_count in a
+  separate committed transaction and parks rows as failed.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.CreatePass
+INPUT:
+- MUST: run per registered table, draining that table fully before moving to the next
+- MUST: maintain an in-memory attempted set of (table_name, partition_name) pairs tried this tick
+RETURN:
+- MUST: loop, beginning each iteration with BEGIN
+- MUST: "select one pending row with `SELECT * FROM parter.managed_partitions WHERE table_name = <table_name> AND status = 'pending' AND (table_name, partition_name) <> ALL(attempted) ORDER BY range_start FOR UPDATE SKIP LOCKED LIMIT 1`"
+- WHEN: no row is returned
+  MUST: COMMIT and exit the pass
+- MUST: add the selected row's (table_name, partition_name) to the attempted set before acting on it
+- MUST: attempt each pending row AT MOST ONCE per tick, so a poison row neither livelocks the pass nor starves newer rows behind it in range_start order
+- CONFORMS: ./coordination@parter.Coordination::INVARIANT
+SIDE-EFFECT:
+- MUST: "issue `CREATE TABLE IF NOT EXISTS <schema-qualified partition_name> PARTITION OF <table_name> FOR VALUES FROM (range_start) TO (range_end)`"
+- MUST: "verify the partition is actually attached with correct boundaries by querying pg_class joined to pg_inherits, because `CREATE TABLE IF NOT EXISTS` succeeds even when a standalone previously-detached relation of that name already exists, so a successful CREATE is NOT proof of attachment"
+- MUST: treat a not-attached or boundary-mismatched verification result as a create FAILURE that routes the row to the circuit breaker
+- WHEN: the create and verification succeed
+  MUST: "run `UPDATE parter.managed_partitions SET status = 'created', created_at = now() WHERE (table_name, partition_name) = (...)` in the SAME transaction as the create and verify, since PostgreSQL DDL is transactional"
+- WHEN: the create and verification succeed
+  MUST: COMMIT, increment the parter.created_total counter, and continue the loop
+  USES: ./observability@parter.Metrics
+- USES: ./metadata@parter.ManagedPartitions
+ERROR:
+- WHEN: the context is cancelled or the deadline is exceeded
+  MUST: ROLLBACK and exit the pass, leaving the row pending
+- WHEN: the context is cancelled or the deadline is exceeded
+  MUST-NOT: touch fail_count, because it is not the row's fault
+- WHEN: the create failed OR verification failed
+  MUST: ROLLBACK, leaving the row pending, and increment the parter.create_errors_total counter
+- WHEN: the failure is transient (connection loss, lock_not_available, serialization_failure)
+  MUST: continue to the next tick without advancing the breaker
+- WHEN: the failure is transient (connection loss, lock_not_available, serialization_failure)
+  MUST-NOT: advance the circuit breaker
+- WHEN: the failure is deterministic
+  MUST: advance the circuit breaker
+  USES: parter.CircuitBreaker
+---
+spec: parter.CircuitBreaker
+INPUT:
+- MUST: use fail_count, a column on managed_partitions, as the failure counter
+SIDE-EFFECT:
+- WHEN: advancing the breaker
+  MUST: "persist in a SEPARATE committed transaction AFTER the failed create transaction has rolled back, because an in-transaction bump would be discarded with the rollback and the breaker could never trip: `BEGIN; UPDATE parter.managed_partitions SET fail_count = fail_count + 1, status = CASE WHEN fail_count + 1 >= 5 THEN 'failed' ELSE status END WHERE (table_name, partition_name) = (...) AND status = 'pending'; COMMIT`"
+- MUST: "after 5 failed attempts (fail_count >= 5) set the row status to 'failed' and park it with no further retries"
+  USES: ./metadata@parter.ManagedPartitions
+RETURN:
+- MUST: advance fail_count ONLY for deterministic failures — an invalid range, a missing or non-partitioned parent, a name conflict, an attach/boundary mismatch, or a non-empty DEFAULT partition already holding rows in the new partition's range (SQLSTATE 23514, check_violation)
+- MUST-NOT: advance fail_count for transient failures or for context cancellation/deadline
+- MUST: "treat the count as a running total, not a consecutive counter, noting that a pending row which succeeds leaves the pending state entirely"
+- MUST: share this counter with EnsureReady, which runs the same create pass, so a deterministic failure during a startup or migration run advances fail_count durably and can park a genuinely poison row as failed even before the background goroutine starts
+  SEE: ./ensure-ready@parter.EnsureReady
+ERROR:
+- MUST-NOT: perform any automatic retry of failed rows
+- MUST: "require an operator to reset a failed row manually with `UPDATE <schema>.managed_partitions SET status = 'pending', fail_count = 0 WHERE (table_name, partition_name) = (...) AND status = 'failed'`"
+- MUST: clear fail_count as well as status on reset, or the row re-trips after a single attempt
+- MUST: "count a create that fails because the DEFAULT partition holds rows in the target range (SQLSTATE 23514) as a deterministic failure toward the 5-attempt budget, with recovery requiring the operator to relocate those rows out of the DEFAULT before resetting the parked row"
+INVARIANT:
+- MUST: surface failed rows via the parter.failed gauge
+  USES: ./observability@parter.Metrics

@@ -1,0 +1,79 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The Config, Table, and RangeStrategy public configuration types, plus the
+  shared in-memory Config validation run by both EnsureReady and Start before
+  any database operation.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.RangeStrategy
+INPUT:
+- MUST: "be one of Monthly, Weekly, or Daily, an int enum declared with iota: Monthly=0, Weekly=1, Daily=2"
+RETURN:
+- MUST: denote the partition period unit (a month, an ISO week, or a day) which determines both period-boundary truncation and retention-interval conversion
+- SEE: ./reconcile@parter.Reconcile
+- SEE: ./retention@parter.RetentionPass
+ERROR:
+- MUST: "be rejected by config validation when the value is outside the defined set {Monthly, Weekly, Daily}"
+  SEE: parter.ValidateConfig
+---
+spec: parter.Table
+INPUT:
+- MUST: "carry a Name that is the fully-qualified table name (e.g. \"contacts.contact_state_events\"); Name is required and non-empty"
+- MUST: carry a Strategy of type RangeStrategy giving the partition period
+  USES: parter.RangeStrategy
+- MUST: "carry a Lookahead that is an int count of strategy-unit periods to pre-create ahead of now, and Lookahead MUST be >= 1"
+- MUST: "carry a Retention that is an int count of periods after which partitions are dropped; 0 means never drop and causes the retention pass to be skipped entirely"
+- MUST: "treat Retention 0 as the only way to disable retention; there is no sentinel value meaning \"drop immediately\""
+- MUST: "carry a Namer that is required and non-nil; it receives the range start time and returns the unqualified partition name"
+RETURN:
+- MUST: prepend the parent schema, extracted from Name, to the Namer output in ALL DDL statements, namely CREATE TABLE, DETACH PARTITION, and DROP TABLE
+- MUST: "store the schema-qualified name in the partition_name metadata column"
+- MUST-NOT: parse partition names back to time ranges, because the metadata table is the source of truth for range boundaries
+- MAY: use an arbitrary naming scheme, since the names exist solely for human readability in catalog listings and logs
+ERROR:
+- MUST: be rejected when Name is empty
+- MUST: be rejected when Namer is nil
+- MUST: "be rejected when Lookahead < 1"
+- MUST: "be rejected when Retention < 0"
+- MUST: be rejected when Strategy is not a valid RangeStrategy
+  USES: parter.RangeStrategy
+INVARIANT:
+- MUST: have a Namer that produces unique names for every distinct range_start the table will see
+- MUST: "include enough date components in the Namer output (e.g. for Daily include year-month-day, not just month-day) to guarantee uniqueness"
+- MUST-NOT: "map two distinct periods to the same name, because the second INSERT ... ON CONFLICT DO NOTHING silently drops the duplicate and that period never gets a partition; the failure is persistent and recurs every tick, and only fixing the Namer resolves it"
+  SEE: ./reconcile@parter.Reconcile
+---
+spec: parter.Config
+INPUT:
+- MUST: "carry a Pool of type *pgxpool.Pool that is non-nil"
+- MUST: "carry a Tables of type []Table with at least one entry"
+  USES: parter.Table
+- MUST: "carry a Schema naming the metadata table, defaulting to \"parter\""
+- MAY: "carry an Instance of type *int; nil means not provided, in which case the startup-time offset alone coordinates instances; when set it must be >= 0"
+RETURN:
+- MUST: be the argument bundle for BOTH Start and EnsureReady
+---
+spec: parter.ValidateConfig
+INPUT:
+- MUST: accept a Config
+  USES: parter.Config
+RETURN:
+- MUST: validate a Config in memory before any database operation
+- MUST: be shared by EnsureReady, which returns an error on invalid input, and by Start, which panics on invalid input
+- SEE: ./ensure-ready@parter.EnsureReady
+ERROR:
+- MUST: "treat the input as invalid when Pool is nil"
+- MUST: treat the input as invalid when Tables is empty
+- MUST: treat the input as invalid when any Table.Name is empty
+  USES: parter.Table
+- MUST: treat the input as invalid when any Table.Namer is nil
+- MUST: "treat the input as invalid when any Table.Lookahead < 1, because a zero lookahead races at every period boundary, leaving up to 60s where inserts hit DEFAULT"
+- MUST: "treat the input as invalid when any Table.Retention < 0"
+- MUST: treat the input as invalid when any Table.Strategy is not a valid RangeStrategy
+  USES: parter.RangeStrategy
+- MUST: "treat the input as invalid when Instance is non-nil and *Instance < 0"
+- MUST-NOT: perform the DEFAULT-partition catalog check here, because that check lives in EnsureReady and Start rather than this in-memory validation
+  SEE: ./ensure-ready@parter.EnsureReady

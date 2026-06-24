@@ -1,0 +1,36 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  Start — validates Config and the DEFAULT precondition (panicking on
+  failure) and launches the maintenance and observability goroutines.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.Start
+INPUT:
+- MUST: "accept a context.Context and a Config"
+  USES: ./config@parter.Config
+- MUST: be safe to call from multiple replicas concurrently
+RETURN:
+- MUST: validate Config before proceeding
+  USES: ./config@parter.ValidateConfig
+- MUST: verify that every registered table has a DEFAULT partition before launching the goroutines
+- MUST: launch the background goroutines and return after validation and the DEFAULT check pass
+- MUST: have no error return
+- MUST: keep the launched goroutines running until ctx is cancelled
+SIDE-EFFECT:
+- MUST: launch the background maintenance goroutine
+  USES: ./scheduler@parter.MaintenanceLoop
+- MUST: launch the observability goroutine alongside the maintenance goroutine
+  USES: ./observability@parter.ObservabilityGoroutine
+- MUST: start the observability goroutine unconditionally, even if neither MetricsChan nor ConfigureOtel is ever called
+- MUST: coordinate multiple replicas via FOR UPDATE SKIP LOCKED
+  SEE: ./coordination@parter.Coordination::INVARIANT
+ERROR:
+- WHEN: Config is invalid
+  MUST: panic, applying the same conditions as the in-memory validation
+  CONFORMS: ./config@parter.ValidateConfig::ERROR
+- WHEN: any registered table lacks a DEFAULT partition
+  MUST: "panic, checking SELECT EXISTS(SELECT 1 FROM pg_partitioned_table WHERE partrelid = <parent>::regclass AND partdefid <> 0)"
+- MUST: perform the DEFAULT partition check synchronously before launching the goroutine

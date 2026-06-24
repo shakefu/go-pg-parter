@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  EnsureReady — the synchronous startup hook that prepares schema,
+  migrations, the DEFAULT precondition, reconciliation, and a synchronous
+  create pass.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.EnsureReady
+INPUT:
+- MUST: "accept a context.Context and a Config"
+  USES: ./config@parter.Config
+RETURN:
+- MUST: "return an error, nil on success"
+- MUST: be idempotent
+- MUST: validate Config first, before any other work
+  USES: ./config@parter.ValidateConfig
+- MUST: "execute, in order after validation: (1) create the configured schema, (2) create the managed_partitions table, (3) apply additive column migrations, (4) verify a DEFAULT partition exists for each registered table, (5) run the declarative reconciliation algorithm, (6) execute the create pass synchronously"
+- MUST: "execute `CREATE SCHEMA IF NOT EXISTS <configured_schema>` as step 1"
+- MUST: "execute `CREATE TABLE IF NOT EXISTS <schema>.managed_partitions (...)` as step 2"
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: "apply idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` migrations for columns introduced in newer library versions as step 3"
+  USES: ./metadata@parter.SchemaVersioning
+- MUST: verify for each registered table that a DEFAULT partition exists as step 4
+- MUST: run the declarative reconciliation algorithm for each registered table as step 5, computing the desired partitions from the current period boundary through Lookahead periods ahead and inserting pending rows for any missing periods
+  USES: ./reconcile@parter.Reconcile
+- MUST: execute the create pass synchronously as step 6, creating any partitions whose period has already begun
+  USES: ./create@parter.CreatePass
+- MUST: drain all overdue partitions it can before the service accepts traffic
+ERROR:
+- MUST: return an error when Config is invalid per the in-memory validation conditions
+  CONFORMS: ./config@parter.ValidateConfig::ERROR
+- MUST: "verify, for each registered table, that a DEFAULT partition is defined using `SELECT EXISTS(SELECT 1 FROM pg_partitioned_table WHERE partrelid = <parent>::regclass AND partdefid <> 0)` and return an error if it is absent"
+- MUST-NOT: create the DEFAULT partition; its presence is the operator's responsibility
+SIDE-EFFECT:
+- MUST: create the configured schema, the managed_partitions table, any missing columns, pending metadata rows, and overdue partitions
+- MUST: advance fail_count durably when a deterministic failure occurs during its create pass, because that create pass shares the circuit breaker
+  SEE: ./create@parter.CircuitBreaker
+INVARIANT:
+- MUST: skip a pending row currently locked by another instance's background goroutine, because the create pass uses FOR UPDATE SKIP LOCKED; this skip is intentional
+- MUST: guarantee on return only that all uncontested pending rows are drained, NOT that every partition exists
+- SHOULD: be run when no background goroutines are active, so no rows are contested, when a strict all-or-nothing guarantee is required such as a migration tool that must finish before traffic
+  SEE: ./coordination@parter.Coordination::INVARIANT

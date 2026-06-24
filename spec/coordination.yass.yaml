@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The cross-cutting coordination invariants the rest of the go-pg-parter
+  specs conform to or reference. One spec, INVARIANT-only, stating the five
+  always-true properties of the lock-free maintenance model: multi-instance
+  safety, idempotency, self-healing reconciliation, atomic transitions, and
+  observability through the metadata table.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.Coordination
+INVARIANT:
+- MUST: "multi-instance safe — FOR UPDATE SKIP LOCKED means one instance grabs a pending row and all others skip it and sleep: no blocking, no retry storms, no wasted work; if two instances tick simultaneously the collision is a no-op for the loser"
+  SEE: ./scheduler@parter.MaintenanceLoop
+- MUST: "idempotent — CREATE TABLE IF NOT EXISTS, DROP TABLE IF EXISTS, and INSERT ... ON CONFLICT DO NOTHING are safe to repeat. Retention detach is made safe by ATOMICITY rather than idempotency: Step 1 issues a plain ALTER TABLE ... DETACH PARTITION together with the status = 'detached' update in ONE transaction, so an interrupted or failed detach rolls back wholesale and the row stays 'created' to be retried next tick — there is no partially-detached limbo to recover. PostgreSQL permits only one detach per parent at a time (the brief ACCESS EXCLUSIVE on the parent serializes concurrent detaches) and FOR UPDATE SKIP LOCKED on the metadata row ensures only one instance acts on a given partition, so two detaches of the same partition never overlap"
+  SEE: ./retention@parter.RetentionDetach
+- MUST: "self-healing — declarative reconciliation recomputes the desired state from scratch each tick, so a manually deleted metadata row for a current or future period is re-inserted next tick; past periods (before the current period boundary) are intentionally NOT re-inserted so reconciliation never resurrects rows the retention pass has dropped"
+  SEE: ./reconcile@parter.Reconcile
+- MUST: "atomic — the create pass commits the DDL and the metadata status update in ONE transaction; retention likewise commits each plain DETACH PARTITION together with its status = 'detached' update in ONE transaction, and uses a two-step detach-then-drop in SEPARATE transactions so the slower DROP TABLE never holds the parent's lock; transitions are crash-safe — a rolled-back detach stays 'created', and a row that reached 'detached' is dropped on a later tick"
+  SEE: ./create@parter.CreatePass
+- MUST: "observable — the managed_partitions table is the source of truth; a query SELECT ... WHERE status = 'pending' AND range_start < now() that returns rows means maintenance is behind, suitable for an alerting probe"
+  SEE: ./metadata@parter.ManagedPartitions

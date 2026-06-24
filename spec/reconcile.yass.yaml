@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The declarative reconciliation pass that computes the desired partition set
+  and seeds pending rows. Runs per registered table on every tick and at
+  startup, recomputing the desired set from scratch and inserting pending
+  metadata rows for any missing periods.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.Reconcile
+INPUT:
+- MUST: run per registered table
+- MUST: read the current time via time.Now().UTC()
+- MUST: use the table Lookahead and Strategy
+  SEE: ./config@parter.Table
+RETURN:
+- MUST: compute the desired set of periods that must exist, from the start of the current period boundary through Lookahead periods into the future
+- MUST: "truncate now() to the start of the current month, ISO week, or day per Strategy, computing ALL period-boundary computations in UTC"
+- MUST-NOT: truncate or compute any period boundary in the local timezone, so all instances agree on boundaries regardless of their TZ
+- MUST: advance each subsequent period boundary one strategy-unit from the previous boundary
+- MUST: treat Lookahead as an integer count of strategy-unit periods, so Lookahead=3 Monthly means the current month plus 3 ahead, 4 partitions total
+SIDE-EFFECT:
+- MUST: query managed_partitions for all rows belonging to this table
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: "insert a pending row using `INSERT ... ON CONFLICT DO NOTHING` on the primary key for any desired period with no metadata row, so concurrent reconciliation passes from multiple instances are safe"
+  USES: ./metadata@parter.ManagedPartitions
+- MUST: share this exact seeding logic between EnsureReady and the background goroutine
+- MUST-NOT: maintain a separate seeding code path for initial seeding versus steady-state
+- MUST: proceed to the create pass to drain the pending rows after seeding
+INVARIANT:
+- MUST: re-insert a manually deleted metadata row for a period within the desired set on the next tick, so the model is self-healing for current and future periods
+  SEE: ./coordination@parter.Coordination::INVARIANT
+- MUST-NOT: re-insert past periods before the current period boundary, since the desired set deliberately starts at the current period and not at now()-retention so reconciliation never resurrects rows the retention pass has already dropped
+  SEE: ./retention@parter.RetentionPass
+- MUST: accept that a manually deleted past-period row leaves the physical partition untracked, a storage leak and not data loss, because re-inserting it would loop the detach/drop cycle forever
+- MUST-NOT: delete managed_partitions rows out of band, since the library owns them
+- MUST-NOT: recover from Namer collisions via self-healing, because a Namer returning the same name for two periods makes the ON CONFLICT DO NOTHING silently drop the duplicate every tick, a deterministic and persistent collision that only fixing the Namer resolves
+  SEE: ./config@parter.Table

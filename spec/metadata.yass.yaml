@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=https://textla.dev/yass/v1.schema.json
+---
+description: >
+  The managed_partitions metadata table: its DDL columns, the four partition
+  statuses and their lifecycle, and the idempotent schema-versioning strategy
+  that upgrades older tables in place without a version-tracking marker.
+version: v1
+related:
+- ../context/design-v3.md
+---
+spec: parter.ManagedPartitions
+INPUT:
+- MUST: "the table lives in the configured schema (Config.Schema), defaulting to the schema named parter"
+- MUST: "define column `table_name TEXT NOT NULL`"
+- MUST: "define column `partition_name TEXT NOT NULL`"
+- MUST: "define column `range_start TIMESTAMPTZ NOT NULL`"
+- MUST: "define column `range_end TIMESTAMPTZ NOT NULL`"
+- MUST: "define column `status TEXT NOT NULL DEFAULT 'pending'`"
+  USES: parter.PartitionStatus
+- MUST: "define column `created_at TIMESTAMPTZ`"
+- MUST: "define column `fail_count INT NOT NULL DEFAULT 0` as the circuit-breaker counter"
+- MUST: "declare `PRIMARY KEY (table_name, partition_name)`"
+RETURN:
+- MUST: be the single source of truth for partition boundaries and state
+- MUST: "represent each managed partition as exactly one row in exactly one of the four statuses"
+  USES: parter.PartitionStatus
+SIDE-EFFECT:
+- MUST: "create the schema via `CREATE SCHEMA IF NOT EXISTS <schema>` during EnsureReady"
+  SEE: ./ensure-ready@parter.EnsureReady
+- MUST: "create the table via `CREATE TABLE IF NOT EXISTS <schema>.managed_partitions (...)` during EnsureReady"
+  SEE: ./ensure-ready@parter.EnsureReady
+INVARIANT:
+- MUST: be owned by the library, which owns these rows
+- MUST-NOT: "be modified out of band by operators deleting managed_partitions rows"
+  SEE: ./coordination@parter.Coordination::INVARIANT
+---
+spec: parter.PartitionStatus
+INPUT:
+- MUST: "set the status column to one of the text values 'pending', 'created', 'detached', or 'failed'"
+RETURN:
+- MUST: "treat 'pending' as: needs to be created and attached"
+- MUST: "treat 'created' as: exists and is attached to the parent"
+- MUST: "treat 'detached' as: detached from the parent and awaiting DROP TABLE"
+- MUST: "treat 'failed' as: creation failed repeatedly and the row is parked, requiring manual intervention"
+INVARIANT:
+- MUST: "follow the lifecycle pending -> created -> detached, after which the row is deleted on drop"
+- MUST: "transition pending -> failed via the circuit breaker"
+---
+spec: parter.SchemaVersioning
+INPUT:
+- MUST: include no explicit version marker in the table
+SIDE-EFFECT:
+- MUST: "after CREATE TABLE IF NOT EXISTS, run idempotent `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` statements during EnsureReady to add any columns introduced in newer library versions (e.g. fail_count)"
+  SEE: ./ensure-ready@parter.EnsureReady
+- MUST: "leave a freshly created table unchanged by this step, since it already has those columns; the step only upgrades tables created by an older library version"
+  SEE: ./ensure-ready@parter.EnsureReady
+INVARIANT:
+- MUST: be safe for rolling deploys, since old instances ignore new columns and new instances add them
+- MUST: keep the migrations idempotent
