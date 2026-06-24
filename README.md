@@ -1,5 +1,10 @@
 # go-pg-parter
 
+>[!WARNING]
+> This is not a real project. I mean it is. It probably works. It was an experiment
+> in one-shot agentic development. Use at your own risk. Have it for free if you want
+> it, it's pubilc domain now.
+
 `go-pg-parter` is a PostgreSQL RANGE partition–maintenance library for Go (module
 `github.com/shakefu/go-pg-parter`, root package `parter`).
 
